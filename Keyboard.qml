@@ -151,22 +151,52 @@ Item {
     function loadLanguageLayout(layoutCode) {
         currentLayout = layoutCode
         updateLayoutRows()
+        // Compile the layout with xkbcli rather than reading
+        // /usr/share/X11/xkb/symbols/<code> directly: most layouts define their
+        // real keys in an include (ua's default variant is `include "ua(legacy)"`
+        // plus overrides, ru's is `include "ru(common)"`), so parsing the raw
+        // file only ever sees the handful of override keys. A compiled keymap is
+        // flat, so a plain line match over `key <X> { [ a, b ] }` is enough.
+        // xkbcli ships with libxkbcommon, which Hyprland already depends on.
+        // A Process that is already running ignores `running = true` and keeps
+        // the command it started with, so a second switch while the first
+        // compile is in flight would apply the old layout's symbols to the new
+        // one and never correct itself. Stop it first.
+        layoutLoadProcess.running = false
+        // pipefail so a failed xkbcli is not masked by awk exiting 0, which
+        // would install an empty map and silently leave the keyboard blank.
         layoutLoadProcess.command = ["bash", "-lc",
-            "file=/usr/share/X11/xkb/symbols/" + layoutCode + "; "
-            + "[[ -f \"$file\" ]] || exit 1; "
-            + "awk '\n"
-            + " /^[[:space:]]*xkb_symbols[[:space:]]*\"/ && !seen { seen=1; inblock=1 }\n"
-            + " inblock {\n"
-            + "   if ($0 ~ /\\{/) depth++\n"
-            + "   if (match($0, /key[[:space:]]*<([A-Z0-9]+)>[[:space:]]*\\{[[:space:]]*\\[([^]]+)\\]/, m)) {\n"
-            + "     n=split(m[2], arr, /,/)\n"
-            + "     gsub(/[[:space:]]+/, \"\", arr[1])\n"
-            + "     gsub(/[[:space:]]+/, \"\", arr[2])\n"
-            + "     print m[1] \"\\t\" arr[1] \"\\t\" arr[2]\n"
+            // A key definition spans one line for simple keys but several when
+            // it carries an explicit type, which is how xkbcli emits most
+            // alphabetic keys on ara, in, il, kz, uz and lk:
+            //     key <AD01> {
+            //         type= "FOUR_LEVEL",
+            //         symbols[1]= [ U094C, U0914, NoSymbol, NoSymbol ]
+            //     };
+            // Matching only the single-line form loses every letter on those
+            // layouts and leaves a US keyboard on screen. Buffer the whole
+            // definition instead, then take the symbol list from it. Reading
+            // `symbols[N]=` first matters: `symbols[1]` would otherwise be
+            // mistaken for the bracketed list by a plain `[...]` match.
+            "set -o pipefail; xkbcli compile-keymap --layout \"$1\" 2>/dev/null | awk '\n"
+            + " match($0, /key[[:space:]]*<([A-Z0-9]+)>/, k) { name=k[1]; buf=\"\"; inkey=1 }\n"
+            + " inkey {\n"
+            + "   buf = buf \" \" $0\n"
+            + "   if (index($0, \"}\")) {\n"
+            + "     if (match(buf, /symbols\\[[0-9]+\\][[:space:]]*=[[:space:]]*\\[([^]]+)\\]/, s) ||\n"
+            + "         match(buf, /\\{[[:space:]]*\\[([^]]+)\\]/, s)) {\n"
+            + "       split(s[1], arr, /,/)\n"
+            + "       gsub(/[[:space:]]+/, \"\", arr[1])\n"
+            + "       gsub(/[[:space:]]+/, \"\", arr[2])\n"
+            + "       print name \"\\t\" arr[1] \"\\t\" arr[2]\n"
+            + "     }\n"
+            + "     inkey=0\n"
             + "   }\n"
-            + "   if ($0 ~ /\\}/) { depth--; if (seen && depth <= 0) exit }\n"
             + " }\n"
-            + "' \"$file\""]
+            // Passed as an argument rather than concatenated into the script:
+            // the code comes from hyprctl, and splicing it in would let a stray
+            // space or shell metacharacter change the command.
+            + "'", "onscreen-keyboard", layoutCode]
         layoutLoadProcess.running = true
     }
 
@@ -307,8 +337,17 @@ Item {
         }
     }
 
+    // A letter key is one whose shifted symbol is simply the capital of its
+    // base, which holds in any script and needs no per-alphabet table.
+    // `/^[a-z]$/` recognised only Latin, so Cyrillic and Greek letters were
+    // treated as punctuation: Caps Lock did nothing on them and they rendered
+    // as stacked dual keys. Asking merely whether the base has a capital is not
+    // enough either — French AZERTY carries é on the same key as 2, and é does
+    // have a capital, so Caps Lock would type 2 instead of É.
     function isLetterKey(keyData) {
-        return /^[a-z]$/.test(keyData.t || "")
+        var base = keyData.t || ""
+        var shifted = keyData.s || ""
+        return base.length > 0 && shifted.length > 0 && shifted === base.toUpperCase()
     }
 
     function resolvedTypedChar(keyData) {
@@ -321,24 +360,18 @@ Item {
     // Punctuation/number keys show both symbols stacked (like the
     // reference's `.key.dual`); plain letter keys just swap case.
     function isDualKey(keyData) {
-        return !!keyData.s && !/^[a-z]$/.test(keyData.t || "")
+        return !!keyData.s && !isLetterKey(keyData)
     }
 
-    // Every keystroke goes through here: dispatch focuscurrentorlast to
-    // reclaim focus on the real target window first, then fire the wtype
-    // command a beat later so Hyprland has processed the focus change.
-    Timer {
-        id: focusDelay
-        interval: 25
-        repeat: false
-        property var pendingArgv: []
-        onTriggered: Quickshell.execDetached(focusDelay.pendingArgv)
-    }
-
+    // Every keystroke goes straight to wtype. This used to dispatch
+    // `focuscurrentorlast` first, on the theory that it reclaimed focus for the
+    // real target window — but that dispatcher *toggles* between the current and
+    // previously focused window, so with two or more windows open every keypress
+    // moved focus away and wtype typed into the wrong one. The panel is
+    // `keyboardFocus: None`, so the target never loses focus and there is
+    // nothing to reclaim.
     function sendKeys(argv) {
-        Quickshell.execDetached(Layout.buildFocusCommand())
-        focusDelay.pendingArgv = argv
-        focusDelay.restart()
+        Quickshell.execDetached(argv)
     }
 
     function pressChar(keyData) {

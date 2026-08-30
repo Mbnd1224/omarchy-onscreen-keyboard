@@ -16,8 +16,9 @@ click the bar icon or the panel's own close button.
 
 - `wtype` is preinstalled on Omarchy. If it is missing, use the keyboard's
   Install button, or run `omarchy pkg add wtype hyprland`.
-- Hyprland + `hyprctl` — before every keypress the plugin refocuses the real
-  target window so `wtype` can type into it.
+- Hyprland + `hyprctl` — used to read and cycle the keyboard layout.
+- `xkbcli` (ships with `libxkbcommon`, already a Hyprland dependency) — used to
+  compile the active layout so the key caps show the right symbols.
 
 ## Install
 
